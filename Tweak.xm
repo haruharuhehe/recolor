@@ -1,14 +1,16 @@
 // recolor - aovnet menu -> "Menu Sushi" crimson, applied live in memory.
 //
-// Why runtime and not a hex patch: aovnet carries a protector
-// (__PROTECT,__integrity "XMPT", __virt_map, __virt_entries,
-// __host_manifest). One changed byte anywhere in __TEXT kills the menu.
+// Runtime, never on disk: aovnet carries a protector (__PROTECT,__integrity
+// "XMPT", __virt_map, __virt_entries, __host_manifest) and one changed byte
+// anywhere in __TEXT kills the menu.
 //
-// Why no scanning: the old version walked every mapped region on the main
-// thread and froze the game into a black screen right after the splash.
-// The table sits at a fixed file offset inside aovnet's __TEXT, and __TEXT
-// has vmaddr 0, so once dyld tells us where the image landed the table
-// address is just image_base + 0x2861070. Nothing to scan.
+// Two candidates get patched:
+//   1. the __const table itself, found at image_base + 0x2861070 via dyld;
+//   2. any writable heap copy of it, because ImGui keeps the colours it draws
+//      with in a runtime ImGuiStyle that was memcpy'd from that table at
+//      startup - patching only the const copy has no visible effect.
+// Everything runs on a serial background queue; the main thread is never
+// touched (an earlier scan-on-main version froze the game to a black screen).
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -31,7 +33,6 @@ static const unsigned char kSig[] = {
     0x8F, 0xC2, 0xF5, 0x3D, 0x00, 0x00, 0x80, 0x3F,
 };
 static const int kSigRel = 0x2B0;   // signature sits this far into the table
-
 
 typedef struct { int rel; float or_, og, ob, nr, ng, nb; } slot_t;
 
@@ -104,13 +105,16 @@ static const size_t kSlotCount = sizeof(kSlots) / sizeof(kSlots[0]);
 
 #define kTableOffset 0x2861070ULL   // ImGuiCol table, from aovnet image base
 #define kTableSpan   0x500          // last slot sits at 0x480 + 16 bytes
+#define kMaxTables   8
+
+typedef struct { vm_address_t addr; int writable; int from_heap; } table_t;
 
 static dispatch_queue_t gQueue;
 static dispatch_source_t gTimer;
-static vm_address_t gTable = 0;
-static int gWritable = 0;
+static table_t gTables[kMaxTables];
+static int gTableCount = 0;
 static int gTicks = 0;
-static int gLogged = 0;
+static int gBest = 0;      // most slots ever patched in one pass
 static int gAlerted = 0;
 
 static inline BOOL slotIsOld(const float *f, const slot_t *s) {
@@ -125,9 +129,20 @@ static inline BOOL slotIsNew(const float *f, const slot_t *s) {
            fabsf(f[2] - s->nb) < 1e-4f;
 }
 
-// Ask dyld where aovnet landed, then read the table straight out of its
-// __TEXT at a known offset. Cheap, safe, and works however it was loaded.
-static vm_address_t locateTable(void) {
+static void addTable(vm_address_t addr, int fromHeap) {
+    for (int i = 0; i < gTableCount; i++)
+        if (gTables[i].addr == addr) return;
+    if (gTableCount >= kMaxTables) return;
+    gTables[gTableCount].addr = addr;
+    gTables[gTableCount].writable = 0;
+    gTables[gTableCount].from_heap = fromHeap;
+    gTableCount++;
+    NSLog(@"[recolor] table #%d @ 0x%lx%s", gTableCount, (unsigned long)addr,
+          fromHeap ? " (heap copy)" : " (const)");
+}
+
+// 1. the table inside aovnet's __TEXT, at a known offset
+static void locateConstTable(void) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
@@ -135,12 +150,43 @@ static vm_address_t locateTable(void) {
         const struct mach_header_64 *h =
             (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!h) continue;
-        vm_address_t table = (vm_address_t)h + kTableOffset;
-        if (memcmp((const void *)(table + kSigRel), kSig, sizeof(kSig)) == 0)
-            return table;
-        NSLog(@"[recolor] %s found, but the table signature does not match", name);
+        vm_address_t t = (vm_address_t)h + kTableOffset;
+        if (memcmp((const void *)(t + kSigRel), kSig, sizeof(kSig)) == 0)
+            addTable(t, 0);
+        else
+            NSLog(@"[recolor] %s loaded, table signature mismatch", name);
     }
-    return 0;
+}
+
+// 2. the live copy ImGui actually draws with, somewhere on the heap
+static void scanBlock(vm_address_t base, vm_size_t size) {
+    const unsigned char *p = (const unsigned char *)base;
+    const unsigned char *last = p + size - sizeof(kSig);
+    for (const unsigned char *q = p; q <= last; q += 4) {
+        if (q[0] != kSig[0] || q[16] != kSig[16]) continue;
+        if (memcmp(q, kSig, sizeof(kSig)) != 0) continue;
+        addTable((vm_address_t)(q - kSigRel), 1);
+        if (gTableCount >= kMaxTables) return;
+    }
+}
+
+static void scanHeap(void) {
+    vm_address_t addr = 0;
+    for (;;) {
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &count, &object);
+        if (kr != KERN_SUCCESS) break;
+        vm_prot_t p = info.protection;
+        if ((p & VM_PROT_WRITE) && !(p & VM_PROT_EXECUTE) &&
+            size >= 0x1000 && size <= (64u << 20))
+            scanBlock(addr, size);
+        addr += size;
+    }
 }
 
 static BOOL makeWritable(vm_address_t table) {
@@ -156,17 +202,17 @@ static BOOL makeWritable(vm_address_t table) {
     return YES;
 }
 
-static int applyTable(vm_address_t table) {
+static int applyTable(int idx) {
+    vm_address_t table = gTables[idx].addr;
     int n = 0;
     for (size_t i = 0; i < kSlotCount; i++) {
         const slot_t *s = &kSlots[i];
         float *f = (float *)(table + s->rel);
         if (slotIsNew(f, s)) { n++; continue; }
         if (!slotIsOld(f, s)) continue;
-        if (!gWritable) {
+        if (!gTables[idx].writable) {
             if (!makeWritable(table)) return 0;
-            gWritable = 1;
-            NSLog(@"[recolor] made the __const page writable");
+            gTables[idx].writable = 1;
         }
         f[0] = s->nr; f[1] = s->ng; f[2] = s->nb;   // alpha untouched
         n++;
@@ -174,22 +220,27 @@ static int applyTable(vm_address_t table) {
     return n;
 }
 
-static void tick(void) {   // always runs on gQueue, never on main
+static void tick(void) {   // gQueue only, never main
     gTicks++;
-    if (!gTable) gTable = locateTable();
 
-    if (gTable) {
-        int n = applyTable(gTable);
-        if (n && !gLogged) {
-            gLogged = 1;
-            NSLog(@"[recolor] crimson applied: %d/%d slots", n, (int)kSlotCount);
-        }
-        return;
-    }
+    BOOL haveConst = NO;
+    for (int i = 0; i < gTableCount; i++) if (!gTables[i].from_heap) haveConst = YES;
+    if (!haveConst && (gTicks < 30 || gTicks % 10 == 0)) locateConstTable();
 
-    // Still nothing after ~20 s: tell the user without needing a log viewer.
-    if (gTicks == 20 && !gAlerted) {
+    // the heap copy only shows up once the menu style has been built
+    if (gTicks <= 90 && (gTicks < 30 ? gTicks % 2 == 0 : gTicks % 6 == 0)) scanHeap();
+
+    int total = 0;
+    for (int i = 0; i < gTableCount; i++) total += applyTable(i);
+    if (total > gBest) gBest = total;
+
+    if (gTicks == 15 && !gAlerted) {
         gAlerted = 1;
+        int heap = 0;
+        for (int i = 0; i < gTableCount; i++) if (gTables[i].from_heap) heap++;
+        NSString *msg = [NSString stringWithFormat:
+                         @"tables: %d (heap %d)  patched: %d/%d",
+                         gTableCount, heap, gBest, (int)kSlotCount];
         dispatch_async(dispatch_get_main_queue(), ^{
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -201,13 +252,13 @@ static void tick(void) {   // always runs on gQueue, never on main
             UIViewController *vc = key.rootViewController;
             if (!vc) return;
             UIAlertController *a = [UIAlertController
-                alertControllerWithTitle:@"recolor"
-                                 message:@"dylib loaded, aovnet not found yet"
+                alertControllerWithTitle:@"recolor" message:msg
                           preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
             [vc presentViewController:a animated:YES completion:nil];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6ull * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                [a dismissViewControllerAnimated:YES completion:nil];
+            });
         });
     }
 }
@@ -216,9 +267,8 @@ __attribute__((constructor))
 static void recolor_init(void) {
     gQueue = dispatch_queue_create("com.olltaterfx.recolor", DISPATCH_QUEUE_SERIAL);
     gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gQueue);
-    // First look at 4 s so the app gets through launch untouched, then 1 s.
     dispatch_source_set_timer(gTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, 4ull * NSEC_PER_SEC),
+                              dispatch_time(DISPATCH_TIME_NOW, 3ull * NSEC_PER_SEC),
                               NSEC_PER_SEC, NSEC_PER_SEC / 2);
     dispatch_source_set_event_handler(gTimer, ^{ tick(); });
     dispatch_resume(gTimer);
