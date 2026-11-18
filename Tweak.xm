@@ -11,6 +11,7 @@
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <mach/vm_region.h>
+#import <mach/vm_page_size.h>
 #import <math.h>
 #import <string.h>
 
@@ -96,7 +97,11 @@ static const slot_t kSlots[] = {
 };
 static const size_t kSlotCount = sizeof(kSlots) / sizeof(kSlots[0]);
 
-static vm_address_t gTables[16];
+#define kTableSpan 0x500   // last slot sits at 0x480 + 16 bytes
+
+typedef struct { vm_address_t addr; int writable; } table_t;
+
+static table_t gTables[16];
 static int gTableCount = 0;
 static int gTicks = 0;
 static int gLogged = 0;
@@ -113,8 +118,27 @@ static inline BOOL slotIsNew(const float *f, const slot_t *s) {
            fabsf(f[2] - s->nb) < 1e-4f;
 }
 
-static int applyTable(vm_address_t table) {
+static int applyTable(int idx) {
+    vm_address_t table = gTables[idx].addr;
     int n = 0;
+
+    // The table lives in __TEXT,__const, so the page is mapped read-only.
+    // VM_PROT_COPY gives us a private COW copy we are allowed to write.
+    if (!gTables[idx].writable) {
+        vm_address_t lo = table & ~(vm_address_t)(vm_page_size - 1);
+        vm_address_t hi = (table + kTableSpan + vm_page_size - 1) &
+                          ~(vm_address_t)(vm_page_size - 1);
+        kern_return_t kr = vm_protect(mach_task_self(), lo, hi - lo, FALSE,
+                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        if (kr != KERN_SUCCESS) {
+            NSLog(@"[recolor] vm_protect failed (%d) on 0x%lx", kr, (unsigned long)table);
+            return 0;
+        }
+        gTables[idx].writable = 1;
+        NSLog(@"[recolor] made 0x%lx writable (%lu bytes)", (unsigned long)lo,
+              (unsigned long)(hi - lo));
+    }
+
     for (size_t i = 0; i < kSlotCount; i++) {
         const slot_t *s = &kSlots[i];
         float *f = (float *)(table + s->rel);
@@ -134,9 +158,11 @@ static void scanRegion(vm_address_t base, vm_size_t size) {
         if (memcmp(q, kSig, sizeof(kSig)) != 0) continue;
         vm_address_t table = (vm_address_t)(q - kSigRel);
         for (int i = 0; i < gTableCount; i++)
-            if (gTables[i] == table) goto next;
+            if (gTables[i].addr == table) goto next;
         if (gTableCount < (int)(sizeof(gTables) / sizeof(gTables[0]))) {
-            gTables[gTableCount++] = table;
+            gTables[gTableCount].addr = table;
+            gTables[gTableCount].writable = 0;
+            gTableCount++;
             NSLog(@"[recolor] ImGuiCol table @ 0x%lx", (unsigned long)table);
         }
     next:;
@@ -154,8 +180,10 @@ static void walkAndScan(void) {
                                         VM_REGION_BASIC_INFO_64,
                                         (vm_region_info_t)&info, &count, &object);
         if (kr != KERN_SUCCESS) break;
-        vm_prot_t want = VM_PROT_READ | VM_PROT_WRITE;
-        if ((info.protection & want) == want &&
+        // __const is read-only, __DATA is read-write, both are fair game.
+        // Skip executable pages: nothing we want lives there and they cost time.
+        if ((info.protection & VM_PROT_READ) &&
+            !(info.protection & VM_PROT_EXECUTE) &&
             size >= 0x1000 && size <= (256u << 20)) {
             scanRegion(addr, size);
         }
@@ -168,10 +196,15 @@ static void tick(void) {
     gTicks++;
     // A full walk is a few hundred MB of memcmp - do it sparingly, and only
     // while the table is still missing (~30 s of hunting).
-    if (gTableCount == 0 && gTicks <= 40 && (gTicks & 1)) walkAndScan();
+    // aovnet may be dlopen'ed long after we start, so keep looking - just
+    // back off to a lazy cadence once the first 30 s are gone.
+    if (gTableCount == 0) {
+        BOOL hot = gTicks <= 40;
+        if (hot ? (gTicks & 1) : (gTicks % 13 == 0)) walkAndScan();
+    }
 
     int slots = 0;
-    for (int i = 0; i < gTableCount; i++) slots += applyTable(gTables[i]);
+    for (int i = 0; i < gTableCount; i++) slots += applyTable(i);
     if (slots && !gLogged) {
         gLogged = 1;
         NSLog(@"[recolor] crimson applied: %d/%d slots over %d table(s)",
