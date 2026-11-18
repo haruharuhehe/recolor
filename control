@@ -1,0 +1,9 @@
+Package: com.olltaterfx.recolor
+Name: aovnet menu recolour
+Version: 1.0
+Architecture: iphoneos-arm
+Description: Live ImGuiCol recolour for aovnet. Nothing on disk is patched.
+Maintainer: ollie
+Author: ollie
+Section: Tweaks
+Depends: mobilesubstrate

@@ -1,0 +1,41 @@
+name: build tweak
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: host deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make git curl file unzip xz-utils fakeroot libxml2-utils
+
+      - name: install theos
+        run: |
+          export THEOS="$HOME/theos"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "THEOS_MAKE_PATH=$THEOS/makefiles" >> "$GITHUB_ENV"
+          echo "y" | bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+
+      - name: build
+        run: |
+          make clean || true
+          make package FINALPACKAGE=1 DEBUG=0
+
+      - name: show result
+        run: |
+          ls -la packages/
+          find .theos/obj -name 'recolor.dylib' -exec ls -la {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recolor
+          if-no-files-found: error
+          path: |
+            packages/*.deb
+            .theos/obj/**/recolor.dylib

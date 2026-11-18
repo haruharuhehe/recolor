@@ -1,0 +1,2 @@
+# keep bytes exactly as committed: make/control cannot survive CRLF
+* -text
