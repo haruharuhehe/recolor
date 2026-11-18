@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  THEOS: /home/runner/theos
+  THEOS_MAKE_PATH: /home/runner/theos/makefiles
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,12 +19,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make git curl file unzip xz-utils fakeroot libxml2-utils
 
+      - name: cache theos
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/theos
+          key: theos-linux-v2
+
       - name: install theos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          export THEOS="$HOME/theos"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          echo "THEOS_MAKE_PATH=$THEOS/makefiles" >> "$GITHUB_ENV"
-          echo "y" | bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          if [ -d "$THEOS/makefiles" ] && [ -d "$THEOS/sdks" ]; then
+            echo "theos already cached"
+            ls "$THEOS/sdks"
+            exit 0
+          fi
+          # the installer talks to api.github.com, which rate-limits shared
+          # runner IPs, so give it a few goes before giving up.
+          for i in 1 2 3 4 5; do
+            echo "== attempt $i =="
+            echo "y" | bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)" && break
+            echo "attempt $i failed, waiting 25s"
+            sleep 25
+          done
+          if [ ! -d "$THEOS/makefiles" ]; then
+            echo "::error::theos install failed after 5 attempts"
+            exit 1
+          fi
+          ls "$THEOS/sdks"
 
       - name: build
         run: |
