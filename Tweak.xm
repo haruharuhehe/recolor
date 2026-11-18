@@ -1,21 +1,25 @@
-// Tweak.xm - aovnet menu -> "Menu Sushi" crimson, applied live in memory.
+// recolor - aovnet menu -> "Menu Sushi" crimson, applied live in memory.
 //
-// The dylib carries a protector (__PROTECT,__integrity magic "XMPT",
-// __virt_map, __virt_entries, __host_manifest). A single byte changed in
-// __TEXT,__const kills the menu, even though XMPT only stores digests for
-// __TEXT,__text and __PROTECT,__dcb_trap - so the protector watches more
-// than it advertises. Never touch the file: find the ImGuiCol table in
-// memory and rewrite the floats there.
+// Why runtime and not a hex patch: aovnet carries a protector
+// (__PROTECT,__integrity "XMPT", __virt_map, __virt_entries,
+// __host_manifest). One changed byte anywhere in __TEXT kills the menu.
+//
+// Why no scanning: the old version walked every mapped region on the main
+// thread and froze the game into a black screen right after the splash.
+// The table sits at a fixed file offset inside aovnet's __TEXT, and __TEXT
+// has vmaddr 0, so once dyld tells us where the image landed the table
+// address is just image_base + 0x2861070. Nothing to scan.
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <mach/vm_region.h>
 #import <mach/vm_page_size.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <math.h>
 #import <string.h>
 
-// 64-byte fingerprint taken from the live ImGuiCol table, 0x2B0 bytes in.
 static const unsigned char kSig[] = {
     0xEC, 0x51, 0x38, 0x3E, 0xC3, 0xF5, 0x28, 0x3F,
     0x29, 0x5C, 0x0F, 0x3F, 0x00, 0x00, 0x80, 0x3F,
@@ -26,7 +30,7 @@ static const unsigned char kSig[] = {
     0xEC, 0x51, 0xB8, 0x3D, 0xB8, 0x1E, 0x05, 0x3E,
     0x8F, 0xC2, 0xF5, 0x3D, 0x00, 0x00, 0x80, 0x3F,
 };
-static const int kSigRel = 0x2B0;
+
 
 typedef struct { int rel; float or_, og, ob, nr, ng, nb; } slot_t;
 
@@ -97,14 +101,16 @@ static const slot_t kSlots[] = {
 };
 static const size_t kSlotCount = sizeof(kSlots) / sizeof(kSlots[0]);
 
-#define kTableSpan 0x500   // last slot sits at 0x480 + 16 bytes
+#define kTableOffset 0x2861070ULL   // ImGuiCol table, from aovnet image base
+#define kTableSpan   0x500          // last slot sits at 0x480 + 16 bytes
 
-typedef struct { vm_address_t addr; int writable; } table_t;
-
-static table_t gTables[16];
-static int gTableCount = 0;
+static dispatch_queue_t gQueue;
+static dispatch_source_t gTimer;
+static vm_address_t gTable = 0;
+static int gWritable = 0;
 static int gTicks = 0;
 static int gLogged = 0;
+static int gAlerted = 0;
 
 static inline BOOL slotIsOld(const float *f, const slot_t *s) {
     return fabsf(f[0] - s->or_) < 1e-4f &&
@@ -118,106 +124,99 @@ static inline BOOL slotIsNew(const float *f, const slot_t *s) {
            fabsf(f[2] - s->nb) < 1e-4f;
 }
 
-static int applyTable(int idx) {
-    vm_address_t table = gTables[idx].addr;
-    int n = 0;
-
-    // The table lives in __TEXT,__const, so the page is mapped read-only.
-    // VM_PROT_COPY gives us a private COW copy we are allowed to write.
-    if (!gTables[idx].writable) {
-        vm_address_t lo = table & ~(vm_address_t)(vm_page_size - 1);
-        vm_address_t hi = (table + kTableSpan + vm_page_size - 1) &
-                          ~(vm_address_t)(vm_page_size - 1);
-        kern_return_t kr = vm_protect(mach_task_self(), lo, hi - lo, FALSE,
-                                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-        if (kr != KERN_SUCCESS) {
-            NSLog(@"[recolor] vm_protect failed (%d) on 0x%lx", kr, (unsigned long)table);
-            return 0;
-        }
-        gTables[idx].writable = 1;
-        NSLog(@"[recolor] made 0x%lx writable (%lu bytes)", (unsigned long)lo,
-              (unsigned long)(hi - lo));
+// Ask dyld where aovnet landed, then read the table straight out of its
+// __TEXT at a known offset. Cheap, safe, and works however it was loaded.
+static vm_address_t locateTable(void) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "aovnet")) continue;
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h) continue;
+        vm_address_t table = (vm_address_t)h + kTableOffset;
+        if (memcmp((const void *)(table + kSigRel), kSig, sizeof(kSig)) == 0)
+            return table;
+        NSLog(@"[recolor] %s found, but the table signature does not match", name);
     }
+    return 0;
+}
 
+static BOOL makeWritable(vm_address_t table) {
+    vm_address_t lo = table & ~(vm_address_t)(vm_page_size - 1);
+    vm_address_t hi = (table + kTableSpan + vm_page_size - 1) &
+                      ~(vm_address_t)(vm_page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), lo, hi - lo, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[recolor] vm_protect failed (%d) at 0x%lx", kr, (unsigned long)lo);
+        return NO;
+    }
+    return YES;
+}
+
+static int applyTable(vm_address_t table) {
+    int n = 0;
     for (size_t i = 0; i < kSlotCount; i++) {
         const slot_t *s = &kSlots[i];
         float *f = (float *)(table + s->rel);
-        if (slotIsNew(f, s)) { n++; continue; }   // already recoloured
-        if (!slotIsOld(f, s)) continue;           // layout moved, leave it alone
-        f[0] = s->nr; f[1] = s->ng; f[2] = s->nb; // alpha untouched
+        if (slotIsNew(f, s)) { n++; continue; }
+        if (!slotIsOld(f, s)) continue;
+        if (!gWritable) {
+            if (!makeWritable(table)) return 0;
+            gWritable = 1;
+            NSLog(@"[recolor] made the __const page writable");
+        }
+        f[0] = s->nr; f[1] = s->ng; f[2] = s->nb;   // alpha untouched
         n++;
     }
     return n;
 }
 
-static void scanRegion(vm_address_t base, vm_size_t size) {
-    unsigned char *p = (unsigned char *)base;
-    unsigned char *last = p + size - sizeof(kSig);
-    for (unsigned char *q = p; q <= last; q += 4) {
-        if (q[0] != kSig[0] || q[16] != kSig[16]) continue;
-        if (memcmp(q, kSig, sizeof(kSig)) != 0) continue;
-        vm_address_t table = (vm_address_t)(q - kSigRel);
-        for (int i = 0; i < gTableCount; i++)
-            if (gTables[i].addr == table) goto next;
-        if (gTableCount < (int)(sizeof(gTables) / sizeof(gTables[0]))) {
-            gTables[gTableCount].addr = table;
-            gTables[gTableCount].writable = 0;
-            gTableCount++;
-            NSLog(@"[recolor] ImGuiCol table @ 0x%lx", (unsigned long)table);
-        }
-    next:;
-    }
-}
-
-static void walkAndScan(void) {
-    vm_address_t addr = 0;
-    for (;;) {
-        vm_size_t size = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-        mach_port_t object = MACH_PORT_NULL;
-        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
-                                        VM_REGION_BASIC_INFO_64,
-                                        (vm_region_info_t)&info, &count, &object);
-        if (kr != KERN_SUCCESS) break;
-        // __const is read-only, __DATA is read-write, both are fair game.
-        // Skip executable pages: nothing we want lives there and they cost time.
-        if ((info.protection & VM_PROT_READ) &&
-            !(info.protection & VM_PROT_EXECUTE) &&
-            size >= 0x1000 && size <= (256u << 20)) {
-            scanRegion(addr, size);
-        }
-        addr += size;
-        if (addr == 0) break;
-    }
-}
-
-static void tick(void) {
+static void tick(void) {   // always runs on gQueue, never on main
     gTicks++;
-    // A full walk is a few hundred MB of memcmp - do it sparingly, and only
-    // while the table is still missing (~30 s of hunting).
-    // aovnet may be dlopen'ed long after we start, so keep looking - just
-    // back off to a lazy cadence once the first 30 s are gone.
-    if (gTableCount == 0) {
-        BOOL hot = gTicks <= 40;
-        if (hot ? (gTicks & 1) : (gTicks % 13 == 0)) walkAndScan();
+    if (!gTable) gTable = locateTable();
+
+    if (gTable) {
+        int n = applyTable(gTable);
+        if (n && !gLogged) {
+            gLogged = 1;
+            NSLog(@"[recolor] crimson applied: %d/%d slots", n, (int)kSlotCount);
+        }
+        return;
     }
 
-    int slots = 0;
-    for (int i = 0; i < gTableCount; i++) slots += applyTable(i);
-    if (slots && !gLogged) {
-        gLogged = 1;
-        NSLog(@"[recolor] crimson applied: %d/%d slots over %d table(s)",
-              slots, (int)kSlotCount, gTableCount);
+    // Still nothing after ~20 s: tell the user without needing a log viewer.
+    if (gTicks == 20 && !gAlerted) {
+        gAlerted = 1;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindow *key = nil;
+            for (UIWindow *w in UIApplication.sharedApplication.windows)
+                if (w.isKeyWindow) { key = w; break; }
+            if (!key) key = UIApplication.sharedApplication.windows.firstObject;
+            UIViewController *vc = key.rootViewController;
+            if (!vc) return;
+            UIAlertController *a = [UIAlertController
+                alertControllerWithTitle:@"recolor"
+                                 message:@"dylib loaded, aovnet not found yet"
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+            [vc presentViewController:a animated:YES completion:nil];
+        });
     }
 }
 
 __attribute__((constructor))
 static void recolor_init(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:0.75 repeats:YES
-                                                       block:^(NSTimer *tm) { (void)tm; tick(); }];
-        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
-        NSLog(@"[recolor] armed");
-    });
+    gQueue = dispatch_queue_create("com.olltaterfx.recolor", DISPATCH_QUEUE_SERIAL);
+    gTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gQueue);
+    // First look at 4 s so the app gets through launch untouched, then 1 s.
+    dispatch_source_set_timer(gTimer,
+                              dispatch_time(DISPATCH_TIME_NOW, 4ull * NSEC_PER_SEC),
+                              NSEC_PER_SEC, NSEC_PER_SEC / 2);
+    dispatch_source_set_event_handler(gTimer, ^{ tick(); });
+    dispatch_resume(gTimer);
+    NSLog(@"[recolor] armed");
 }
