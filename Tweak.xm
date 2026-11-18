@@ -30,6 +30,7 @@ static const unsigned char kSig[] = {
     0xEC, 0x51, 0xB8, 0x3D, 0xB8, 0x1E, 0x05, 0x3E,
     0x8F, 0xC2, 0xF5, 0x3D, 0x00, 0x00, 0x80, 0x3F,
 };
+static const int kSigRel = 0x2B0;   // signature sits this far into the table
 
 
 typedef struct { int rel; float or_, og, ob, nr, ng, nb; } slot_t;
@@ -190,10 +191,13 @@ static void tick(void) {   // always runs on gQueue, never on main
     if (gTicks == 20 && !gAlerted) {
         gAlerted = 1;
         dispatch_async(dispatch_get_main_queue(), ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
             UIWindow *key = nil;
             for (UIWindow *w in UIApplication.sharedApplication.windows)
                 if (w.isKeyWindow) { key = w; break; }
             if (!key) key = UIApplication.sharedApplication.windows.firstObject;
+#pragma clang diagnostic pop
             UIViewController *vc = key.rootViewController;
             if (!vc) return;
             UIAlertController *a = [UIAlertController
